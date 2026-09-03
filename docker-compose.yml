@@ -1,0 +1,93 @@
+# SOC Next-Best-Action Triage Agent -- container orchestration.
+#
+# Two independent profiles so nothing GPU-related runs unless you ask for it:
+#
+#   demo  -- offline, deterministic mock run. No GPU, no network, no model.
+#            docker compose --profile demo up --build
+#
+#   vllm  -- serve GLM-5.2-FP8 with vLLM, then run the agent against it.
+#            Needs NVIDIA GPU(s) + nvidia-container-toolkit + a HF token.
+#            docker compose --profile vllm up --build
+#
+# Config lives in .env (copy .env.example). See readme.md "Running in Docker".
+
+services:
+  # --------------------------------------------------------------------- #
+  # DEMO: fully offline mock. Runs the same output a reviewer sees locally.
+  # --------------------------------------------------------------------- #
+  demo:
+    build: .
+    image: soc-triage-agent
+    profiles: ["demo"]
+    # Default CMD is already ["--mock"]; spelled out here for clarity. Tweak
+    # freely, e.g. ["--mock", "--strategy", "urgency", "--n-per-level", "3"].
+    command: ["--mock"]
+
+  # --------------------------------------------------------------------- #
+  # VLLM: OpenAI-compatible GLM-5.2-FP8 endpoint.
+  #
+  # NOTE ON SIZE: GLM-5.2 is a ~744B-parameter MoE model; even FP8 weights are
+  # hundreds of GB and require multiple high-memory GPUs. This service is a
+  # correct, ready-to-run config -- it will only actually boot on adequate
+  # hardware. Set LLM_MODEL / VLLM_TP_SIZE / VLLM_GPU_COUNT in .env to match
+  # your box. For a no-hardware walkthrough, use the `demo` profile instead.
+  # --------------------------------------------------------------------- #
+  vllm:
+    image: vllm/vllm-openai:${VLLM_IMAGE_TAG:-latest}
+    profiles: ["vllm"]
+    command:
+      - "--model"
+      - "${LLM_MODEL:-zai-org/GLM-5.2-FP8}"
+      - "--served-model-name"
+      - "${LLM_MODEL:-zai-org/GLM-5.2-FP8}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+      - "--tensor-parallel-size"
+      - "${VLLM_TP_SIZE:-1}"
+      - "--max-model-len"
+      - "${VLLM_MAX_MODEL_LEN:-8192}"
+    environment:
+      # Needed to pull gated/large weights from Hugging Face.
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      # Persist the (huge) model download across runs.
+      - hf-cache:/root/.cache/huggingface
+    ports:
+      - "${VLLM_HOST_PORT:-8000}:8000"
+    ipc: host  # vLLM uses shared memory across worker processes
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${VLLM_GPU_COUNT:-all}
+              capabilities: ["gpu"]
+    healthcheck:
+      # vLLM exposes /health once the server is ready to accept requests.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 60          # weight load + warmup can take a long time
+      start_period: 600s
+
+  # --------------------------------------------------------------------- #
+  # AGENT: the triage agent pointed at the vllm service (real, non-mock run).
+  # --------------------------------------------------------------------- #
+  agent:
+    build: .
+    image: soc-triage-agent
+    profiles: ["vllm"]
+    depends_on:
+      vllm:
+        condition: service_healthy
+    environment:
+      LLM_BASE_URL: "http://vllm:8000/v1"
+      LLM_MODEL: "${LLM_MODEL:-zai-org/GLM-5.2-FP8}"
+      LLM_API_KEY: "local"  # vLLM ignores it; the OpenAI client requires non-empty
+    # No --mock: run the real pipeline against the vLLM endpoint above.
+    command: ["--strategy", "fifo", "--n-per-level", "1"]
+
+volumes:
+  hf-cache:
