@@ -41,6 +41,41 @@ uv run python -m soc_triage.demo
 > the endpoint can live anywhere (local GPU box or a shared/remote vLLM). For
 > review, `--mock` reproduces the full behaviour with no model required.
 
+---
+
+## Running in Docker
+
+The image (`Dockerfile`) contains only the agent — never the model. `docker-compose.yml`
+exposes two independent profiles.
+
+**Demo (offline, deterministic — no GPU, no network, no model):**
+
+```bash
+docker compose --profile demo up --build
+```
+
+This runs `python -m soc_triage.demo --mock` inside the container and prints the
+same walkthrough as the local run. Tweak the args via the `demo` service's
+`command` (e.g. `--strategy urgency`, `--n-per-level 3`).
+
+**Real run (vLLM serving GLM-5.2-FP8 + the agent against it):**
+
+```bash
+cp .env.example .env        # set HUGGING_FACE_HUB_TOKEN and GPU/model knobs
+docker compose --profile vllm up --build
+```
+
+This starts a `vllm/vllm-openai` container serving `LLM_MODEL` on an
+OpenAI-compatible endpoint, waits for its `/health` check, then runs the `agent`
+container pointed at `http://vllm:8000/v1`. Configure the model id, GPU count,
+tensor-parallel size, and context length in `.env` (see `.env.example`).
+
+> **Requirements for the `vllm` profile.** NVIDIA GPU(s) with enough combined
+> memory for GLM-5.2-FP8 (hundreds of GB — see the footprint note above), the
+> [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
+> and a Hugging Face token. On a machine without adequate GPUs the `vllm`
+> service will not boot; use the `demo` profile to see the full agent behaviour.
+
 The demo prints: synthetic items → per-item triage decisions → the live queue
 and "what's next?" → an explicit emergency-jumps-the-queue scenario → the
 failure path → the dead-letter summary. Try `--strategy urgency` to see the
